@@ -1,0 +1,153 @@
+создать setup_db2.py
+
+CREATE TABLE IF NOT EXISTS data_quality_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT,           -- когда проверили
+    check_name TEXT,          -- название проверки
+    source TEXT,              -- 'streaming' или 'batch'
+    status TEXT,              -- 'PASS', 'WARN', 'FAIL'
+    details TEXT,             -- подробности
+    threshold REAL            -- порог (если есть)
+);
+
+
+добавить проверки в run_full_pipeline:
+
+# 1. Проверка координат (не вышли ли за границы кадра)
+frame_height, frame_width = frame.shape[:2]
+if not (0 <= x <= frame_width and 0 <= y <= frame_height):
+    conn.execute("""
+        INSERT INTO data_quality_log (timestamp, check_name, source, status, details)
+        VALUES (?, ?, ?, ?, ?)
+    """, (datetime.now().isoformat(), 'invalid_coordinates', 'streaming', 'WARN', 
+          f'x={x}, y={y}, frame={frame_width}x{frame_height}'))
+
+# 2. Проверка уверенности (не слишком ли низкая)
+if confidence < 0.3:
+    conn.execute("""
+        INSERT INTO data_quality_log (timestamp, check_name, source, status, details, threshold)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (datetime.now().isoformat(), 'low_confidence', 'streaming', 'WARN',
+          f'confidence={confidence:.2f}', 0.3))
+
+# 3. Проверка дубликатов (сохраняем последний frame_id в переменную)
+#    Для простоты – проверим, не было ли такого же frame_id и типа
+cur.execute("SELECT COUNT(*) FROM detections WHERE frame_id = ? AND vehicle_type = ?", 
+            (frame_id, vehicle_type))
+if cur.fetchone()[0] > 0:
+    conn.execute("""
+        INSERT INTO data_quality_log (timestamp, check_name, source, status, details)
+        VALUES (?, ?, ?, ?, ?)
+    """, (datetime.now().isoformat(), 'duplicate_detection', 'streaming', 'WARN',
+          f'frame_id={frame_id}, type={vehicle_type}'))
+
+ 
+
+quality_checks_batch.py:
+import sqlite3
+import pandas as pd
+from datetime import datetime
+
+DB_PATH = 'data/traffic.db'
+
+def run_batch_quality_checks():
+    conn = sqlite3.connect(DB_PATH)
+    
+    # 1. ПРОВЕРКА ПОЛНОТЫ (нет ли пустых значений)
+    df = pd.read_sql_query("SELECT confidence, vehicle_type FROM detections", conn)
+    null_conf_pct = df['confidence'].isnull().mean() * 100
+    null_type_pct = df['vehicle_type'].isnull().mean() * 100
+    
+    status_conf = 'PASS' if null_conf_pct < 5 else 'FAIL'
+    conn.execute("""
+        INSERT INTO data_quality_log (timestamp, check_name, source, status, details, threshold)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (datetime.now().isoformat(), 'null_confidence', 'batch', status_conf,
+          f'{null_conf_pct:.1f}% пропусков', 5))
+    
+    status_type = 'PASS' if null_type_pct < 5 else 'FAIL'
+    conn.execute("""
+        INSERT INTO data_quality_log (timestamp, check_name, source, status, details, threshold)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (datetime.now().isoformat(), 'null_vehicle_type', 'batch', status_type,
+          f'{null_type_pct:.1f}% пропусков', 5))
+    
+    # 2. ПРОВЕРКА ДУБЛИКАТОВ
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COUNT(*) as total, COUNT(DISTINCT frame_id || timestamp) as unique_count
+        FROM detections
+    """)
+    total, unique = cur.fetchone()
+    dup_pct = (total - unique) / total * 100 if total > 0 else 0
+    dup_status = 'WARN' if dup_pct > 1 else 'PASS'
+    conn.execute("""
+        INSERT INTO data_quality_log (timestamp, check_name, source, status, details, threshold)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (datetime.now().isoformat(), 'duplicate_rows', 'batch', dup_status,
+          f'{dup_pct:.2f}% дубликатов', 1))
+    
+    # 3. ПРОВЕРКА АНОМАЛИЙ (резкие скачки интенсивности)
+    metrics_df = pd.read_sql_query("""
+        SELECT total_vehicles FROM metrics 
+        WHERE minute_bucket >= datetime('now', '-1 hour')
+    """, conn)
+    if not metrics_df.empty:
+        avg_intensity = metrics_df['total_vehicles'].mean()
+        max_intensity = metrics_df['total_vehicles'].max()
+        if max_intensity > avg_intensity * 3:
+            conn.execute("""
+                INSERT INTO data_quality_log (timestamp, check_name, source, status, details)
+                VALUES (?, ?, ?, ?, ?)
+            """, (datetime.now().isoformat(), 'intensity_anomaly', 'batch', 'WARN',
+                  f'Максимум {max_intensity} > {avg_intensity:.1f} * 3'))
+    
+    conn.commit()
+    conn.close()
+    print("Пакетные проверки качества завершены")
+
+if __name__ == "__main__":
+    run_batch_quality_checks()
+
+
+
+quality_dashboard.py:
+import streamlit as st
+import sqlite3
+import pandas as pd
+import plotly.express as px
+
+st.set_page_config(page_title="Мониторинг качества данных", layout="wide")
+st.title("Дашборд контроля качества данных")
+
+conn = sqlite3.connect('data/traffic.db')
+
+df_log = pd.read_sql_query("""
+    SELECT * FROM data_quality_log 
+    ORDER BY timestamp DESC 
+    LIMIT 100
+""", conn)
+
+if df_log.empty:
+    st.warning("Нет данных о качестве")
+    st.stop()
+
+st.subheader("Последние проверки")
+st.dataframe(df_log[['timestamp', 'check_name', 'source', 'status', 'details']])
+
+st.subheader("Статус проверок по дням")
+df_log['date'] = pd.to_datetime(df_log['timestamp']).dt.date
+status_counts = df_log.groupby(['date', 'status']).size().reset_index(name='count')
+fig = px.bar(status_counts, x='date', y='count', color='status',
+             title="Количество проверок по статусу")
+st.plotly_chart(fig, use_container_width=True)
+
+st.subheader("Проверки с ошибками (FAIL)")
+fails = df_log[df_log['status'] == 'FAIL']
+st.write(fails[['timestamp', 'check_name', 'details']])
+
+conn.close()
+
+
+streamlit run quality_dashboard.py
+
