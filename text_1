@@ -1,0 +1,114 @@
+docker ps
+Скопировать CONTAINER ID
+docker inspect idвставить --format '{{json .Mounts}}'
+
+traffic_pipeline.py в папку dags:
+from airflow import DAG
+from airflow.operators.bash import BashOperator
+from datetime import datetime, timedelta
+
+default_args = {
+    'owner': 'champion',
+    'start_date': datetime(2026, 4, 1),
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+}
+
+with DAG(
+    dag_id='traffic_pipeline',
+    default_args=default_args,
+    schedule_interval='*/15 * * * *',
+    catchup=False,
+) as dag:
+
+    # Задача 1: детекция и метрики
+    run_detection = BashOperator(
+        task_id='run_full_pipeline',
+        bash_command='python3 /opt/airflow/project/run_full_pipeline.py',
+    )
+
+    # Задача 2: обучение модели (запускается после детекции)
+    train_model = BashOperator(
+        task_id='train_model',
+        bash_command='python3 /opt/airflow/project/train_model.py',
+    )
+
+    # Задача 3: очистка (удаление дубликатов и т.д.)
+    clean_data = BashOperator(
+        task_id='clean_data',
+        bash_command='python3 /opt/airflow/project/clean_data.py', 
+    )
+
+    # Задача 4: обогащение (добавить час, день недели)
+    enrich_data = BashOperator(
+        task_id='enrich_data',
+        bash_command='python3 /opt/airflow/project/enrich_data.py',  
+    )
+	# НОВАЯ ЗАДАЧА: проверки качества
+    quality_checks = BashOperator(
+        task_id='quality_checks_batch',
+        bash_command='python3 /opt/airflow/project/quality_checks_batch.py',
+    )
+
+    # Указываем порядок: сначала детекция, потом всё остальное
+    run_detection >> train_model >> clean_data >> enrich_data >> quality_checks
+
+http://localhost:8080. Нажми на кнопку "Refresh" (обновить) рядом со списком DAG. 
+Если появился DAG с именем traffic_pipeline – отлично. Если нет – значит, файл лежит не в той папке,
+
+
+
+
+enrich_data.py:
+import sqlite3
+from datetime import datetime
+
+conn = sqlite3.connect('data/traffic.db')
+cur = conn.cursor()
+
+# Добавляем колонки, если их нет
+try:
+    cur.execute("ALTER TABLE detections ADD COLUMN hour INTEGER")
+except:
+    pass
+try:
+    cur.execute("ALTER TABLE detections ADD COLUMN dayofweek INTEGER")
+except:
+    pass
+
+# Заполняем их из timestamp
+cur.execute("SELECT id, timestamp FROM detections")
+rows = cur.fetchall()
+for row_id, ts_str in rows:
+    dt = datetime.strptime(ts_str, '%Y-%m-%d %H:%M:%S.%f')
+    cur.execute("UPDATE detections SET hour = ?, dayofweek = ? WHERE id = ?",
+                (dt.hour, dt.weekday(), row_id))
+
+conn.commit()
+conn.close()
+print("Обогащение завершено")
+
+
+
+
+clean_data.py:
+import sqlite3
+
+conn = sqlite3.connect('data/traffic.db')
+cur = conn.cursor()
+
+# Удаляем дубликаты
+cur.execute("""
+    DELETE FROM detections 
+    WHERE id NOT IN (SELECT MIN(id) FROM detections GROUP BY frame_id, timestamp)
+""")
+
+# Приводим типы к нижнему регистру
+cur.execute("UPDATE detections SET vehicle_type = LOWER(vehicle_type)")
+
+# Удаляем записи с низкой уверенностью
+cur.execute("DELETE FROM detections WHERE confidence < 0.3")
+
+conn.commit()
+conn.close()
+print("Очистка завершена")
